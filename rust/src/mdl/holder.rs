@@ -107,19 +107,21 @@ impl MdlPresentationSession {
                 .map_err(|e| RequestError::Generic {
                     value: format!("Could not deserialize request: {e:?}"),
                 })?;
-            self.engaged
+            let engaged = self
+                .engaged
                 .lock()
                 .map_err(|_| RequestError::Generic {
                     value: "Could not lock mutex".to_string(),
                 })?
-                .clone()
-                .process_session_establishment(
-                    session_establishment,
-                    TrustAnchorRegistry::default(),
-                )
-                .map_err(|e| RequestError::Generic {
-                    value: format!("Could not process process session establishment: {e:?}"),
-                })?
+                .clone();
+            pollster::block_on(engaged.process_session_establishment(
+                session_establishment,
+                TrustAnchorRegistry::default(),
+                &(),
+            ))
+            .map_err(|e| RequestError::Generic {
+                value: format!("Could not process process session establishment: {e:?}"),
+            })?
         };
 
         let mut in_process = self.in_process.lock().map_err(|_| RequestError::Generic {

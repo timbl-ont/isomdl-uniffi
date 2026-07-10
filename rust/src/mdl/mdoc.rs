@@ -26,6 +26,7 @@ use isomdl::{
         helpers::{NonEmptyMap, Tag24},
         namespaces::{
             org_iso_18013_5_1::OrgIso1801351, org_iso_18013_5_1_aamva::OrgIso1801351Aamva,
+            org_iso_23220_1::OrgIso232201,
         },
         traits::{FromJson, ToNamespaceMap},
         x509::{
@@ -307,6 +308,68 @@ impl Mdoc {
         )))
     }
 
+    /// Create and sign an ISO 23220-1 photo ID (`org.iso.23220.1.mID`) document.
+    ///
+    /// Uses [`OrgIso232201::from_json`] to ensure correct CBOR field types
+    /// (e.g. `birth_date` as a CBOR map, `portrait` as `bstr`, dates as
+    /// `full-date` tag 1004).
+    ///
+    /// * `photoid_items` — JSON object string with `org.iso.23220.1` namespace elements.
+    /// * `holder_jwk` — P-256 JWK of the holder's device key.
+    /// * `iaca_cert_pem` — PEM-encoded IACA certificate.
+    /// * `iaca_key_pem` — PEM-encoded IACA private key.
+    #[uniffi::constructor]
+    pub fn create_and_sign_photoid(
+        photoid_items: String,
+        holder_jwk: String,
+        iaca_cert_pem: String,
+        iaca_key_pem: String,
+    ) -> Result<Arc<Self>, MdocInitError> {
+        let pub_key: PublicKey =
+            PublicKey::from_jwk_str(&holder_jwk).map_err(|_| MdocInitError::InvalidJwk)?;
+
+        let json_value: serde_json::Value = serde_json::from_str(&photoid_items)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!("photoid_items JSON parse: {e}")))?;
+
+        let ns_data = OrgIso232201::from_json(&json_value)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!(
+                "photo ID namespace parse (org.iso.23220.1): {e}"
+            )))?
+            .to_ns_map();
+
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert("org.iso.23220.1".to_string(), ns_data);
+
+        let doc_type = "org.iso.23220.1.mID".to_string();
+        let builder = prepare_builder(pub_key, namespaces, doc_type)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!("prepare_builder: {e}")))?;
+
+        let (certificate, iaca_certs, signer) =
+            setup_certificate_chain(iaca_cert_pem, iaca_key_pem, None)
+                .map_err(|e| MdocInitError::GeneralConstructionError(format!("certificate chain: {e}")))?;
+
+        let mut x5chain_builder = X5Chain::builder()
+            .with_certificate(certificate)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!("x5chain certificate: {e}")))?;
+
+        for cert in iaca_certs {
+            x5chain_builder = x5chain_builder
+                .with_certificate(cert)
+                .map_err(|e| MdocInitError::GeneralConstructionError(format!("x5chain intermediate: {e}")))?;
+        }
+
+        let x5chain = x5chain_builder
+            .build()
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!("x5chain build: {e}")))?;
+
+        let mdoc = builder
+            .issue::<p256::ecdsa::SigningKey, p256::ecdsa::Signature>(x5chain, signer)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!("issue: {e}")))?;
+
+        let doc = issuance_mdoc_to_document(mdoc)?;
+        Ok(Arc::new(Self::new_from_parts(doc, KeyAlias(Uuid::new_v4().to_string()))))
+    }
+
     /// The local ID of this credential.
     pub fn id(&self) -> Uuid {
         self.inner.id
@@ -471,9 +534,11 @@ impl Mdoc {
 
             let registry = TrustAnchorRegistry::from_pem_certificates(pem_anchors)
                 .map_err(|e| MdocVerificationError::TrustAnchorRegistryError(format!("{:?}", e)))?; // Validate X5Chain against trust anchors using mDL validation rules
-            let validation_errors = isomdl::definitions::x509::validation::ValidationRuleset::Mdl
-                .validate(&x5chain, &registry)
-                .errors;
+            let validation_outcome = pollster::block_on(
+                isomdl::definitions::x509::validation::ValidationRuleset::Mdl
+                    .validate(&x5chain, &registry, &()),
+            );
+            let validation_errors = validation_outcome.errors;
 
             if !validation_errors.is_empty() {
                 return Err(MdocVerificationError::X5ChainValidationFailed(
@@ -753,6 +818,51 @@ impl PreparedMdoc {
         let builder = prepare_builder(pub_key, namespaces, doc_type).map_err(|e| {
             MdocInitError::GeneralConstructionError(format!("prepare_builder: {e}"))
         })?;
+
+        let algorithm = parse_signature_algorithm(&signature_algorithm)?;
+        let prepared = builder
+            .prepare(algorithm)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!("prepare: {e}")))?;
+
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(Some(prepared)),
+        }))
+    }
+
+    /// Prepare an ISO 23220-1 photo ID (`org.iso.23220.1.mID`) document for
+    /// external signing.
+    ///
+    /// Uses [`OrgIso232201::from_json`] to ensure correct CBOR field types.
+    /// Call [`signature_payload()`] to get the bytes to sign, then
+    /// [`complete()`] to finalize.
+    ///
+    /// * `photoid_items` — JSON object string with `org.iso.23220.1` namespace elements.
+    /// * `holder_jwk` — P-256 JWK of the holder's device key.
+    /// * `signature_algorithm` — one of `"ES256"`, `"ES384"`, `"ES512"`.
+    #[uniffi::constructor]
+    pub fn new_photoid(
+        photoid_items: String,
+        holder_jwk: String,
+        signature_algorithm: String,
+    ) -> Result<Arc<Self>, MdocInitError> {
+        let pub_key: PublicKey =
+            PublicKey::from_jwk_str(&holder_jwk).map_err(|_| MdocInitError::InvalidJwk)?;
+
+        let json_value: serde_json::Value = serde_json::from_str(&photoid_items)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!("photoid_items JSON parse: {e}")))?;
+
+        let ns_data = OrgIso232201::from_json(&json_value)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!(
+                "photo ID namespace parse (org.iso.23220.1): {e}"
+            )))?
+            .to_ns_map();
+
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert("org.iso.23220.1".to_string(), ns_data);
+
+        let doc_type = "org.iso.23220.1.mID".to_string();
+        let builder = prepare_builder(pub_key, namespaces, doc_type)
+            .map_err(|e| MdocInitError::GeneralConstructionError(format!("prepare_builder: {e}")))?;
 
         let algorithm = parse_signature_algorithm(&signature_algorithm)?;
         let prepared = builder

@@ -28,7 +28,7 @@ uniffi = { version = "0.29.4", features = [ "build" ] }
 
 [dependencies]
 uniffi = { version = "0.29.4", features = [ "cli" ] }
-isomdl = { git = "https://github.com/spruceid/isomdl", rev = "fed574c"}
+isomdl = { git = "https://github.com/timbl-ont/isomdl", branch = "feat/iso-23220-1-namespace"}
 anyhow = "1.0.98"
 base64 = "0.22.1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -43,6 +43,7 @@ serde_json = "1.0.140"
 sha1 = "0.10.6"
 sha2 = "0.10.8"
 signature = "2.2.0"
+pollster = "0.3"
 thiserror = "2.0.12"
 time = "0.3.41"
 uuid = "1.16.0"

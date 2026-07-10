@@ -130,7 +130,7 @@ pub fn establish_session(
     })?;
 
     let (manager, request, ble_ident) =
-        reader::SessionManager::establish_session(uri.to_string(), namespaces, registry).map_err(
+        reader::SessionManager::establish_session(reader::Handover::QR(uri.to_string()), namespaces, registry).map_err(
             |e| MDLReaderSessionError::Generic {
                 value: format!("unable to establish session: {e:?}"),
             },
@@ -291,7 +291,7 @@ pub fn handle_response(
     response: Vec<u8>,
 ) -> Result<MDLReaderResponseData, MDLReaderResponseError> {
     let mut state = state.0.clone();
-    let validated_response = state.handle_response(&response);
+    let validated_response = pollster::block_on(state.handle_response(&response, &()));
     let errors = if !validated_response.errors.is_empty() {
         Some(
             serde_json::to_string(&validated_response.errors).map_err(|e| {
@@ -686,12 +686,24 @@ pub fn verify_oid4vp_response(
                 })?
             };
 
-            let validation_result = isomdl::presentation::reader_utils::validate_response(
-                transcript,
-                registry,
-                x5chain,
-                doc.clone(),
-                namespaces,
+            // Extract doc_types for validate_response
+            let doc_types: Vec<String> = device_response
+                .documents
+                .as_ref()
+                .map(|docs| docs.iter().map(|d| d.doc_type.clone()).collect())
+                .unwrap_or_default();
+
+            let validation_result = pollster::block_on(
+                isomdl::presentation::reader_utils::validate_response(
+                    transcript,
+                    registry,
+                    x5chain,
+                    doc.clone(),
+                    namespaces,
+                    doc_types,
+                    &(),
+                    [0u8; 32],
+                ),
             );
 
             // Extract doc_type from the parsed document
